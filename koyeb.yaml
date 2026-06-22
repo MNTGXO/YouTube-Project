@@ -1,0 +1,42 @@
+name: youtube-shorts-app
+
+services:
+  - name: shorts-ai
+    type: web
+    # Build from Dockerfile in root
+    git:
+      branch: main
+      build_command: ""
+      run_command: ""
+    docker:
+      dockerfile: Dockerfile
+      target: production
+    instance_type: medium   # Recommended for FFmpeg processing
+    min_scale: 1
+    max_scale: 3
+    ports:
+      - port: 8000
+        protocol: http
+    health_checks:
+      - path: /api/auth/me
+        port: 8000
+        interval: 30
+        timeout: 10
+    env:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "8000"
+      # ⚠️  Set these in Koyeb dashboard as Secrets:
+      - key: MONGODB_URI
+        value: "SET_IN_KOYEB_DASHBOARD"
+      - key: GOOGLE_CLIENT_ID
+        value: "SET_IN_KOYEB_DASHBOARD"
+      - key: GOOGLE_CLIENT_SECRET
+        value: "SET_IN_KOYEB_DASHBOARD"
+      - key: GOOGLE_REDIRECT_URI
+        value: "SET_IN_KOYEB_DASHBOARD"
+      - key: SESSION_SECRET
+        value: "SET_IN_KOYEB_DASHBOARD"
+      - key: FRONTEND_URL
+        value: "SET_IN_KOYEB_DASHBOARD"
