@@ -15,8 +15,8 @@ WORKDIR /app
 # ─── Stage 2: Install backend deps ────────────────────────────────────────────
 FROM base AS deps
 
-COPY backend/package*.json ./backend/
-RUN cd backend && npm ci --only=production
+COPY backend/package.json ./backend/
+RUN cd backend && npm install --omit=dev
 
 # ─── Stage 3: Production image ────────────────────────────────────────────────
 FROM base AS production
