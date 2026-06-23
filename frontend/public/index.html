@@ -458,8 +458,9 @@ async function api(path, opts = {}) {
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 async function checkAuth() {
   try {
-    currentUser = (await api('/api/auth/me')).id ? await api('/api/auth/me') : null;
-    return true;
+    const data = await api('/api/auth/me');
+    currentUser = data.email ? data : null;
+    return !!currentUser;
   } catch {
     currentUser = null;
     return false;
@@ -905,19 +906,40 @@ async function deleteVideo(id) {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 (async () => {
-  // Check for OAuth callback params
+  // Show loading state so page doesn't flash login screen
+  $('#main').innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:center;min-height:60vh;flex-direction:column;gap:16px">
+      <div class="spinner" style="width:32px;height:32px;border-width:3px"></div>
+      <p style="color:var(--muted);font-size:14px">Loading...</p>
+    </div>`;
+
   const params = new URLSearchParams(window.location.search);
-  if (params.get('login') === 'success') {
+  const justLoggedIn = params.get('login') === 'success';
+  const loginError = params.get('error');
+
+  if (justLoggedIn || loginError) {
     window.history.replaceState({}, '', '/');
-    toast('✅ Logged in successfully!', 'success');
-  }
-  if (params.get('error')) {
-    window.history.replaceState({}, '', '/');
-    toast('Login failed: ' + params.get('error'), 'error');
   }
 
-  await checkAuth();
+  // If coming back from OAuth, retry a few times to give session time to propagate
+  let authed = false;
+  const attempts = justLoggedIn ? 4 : 1;
+  for (let i = 0; i < attempts; i++) {
+    authed = await checkAuth();
+    if (authed) break;
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, 600));
+  }
+
   renderApp();
+
+  if (justLoggedIn && authed) {
+    toast('✅ Logged in successfully!', 'success');
+  } else if (justLoggedIn && !authed) {
+    toast('Session issue — please try signing in again.', 'error');
+  }
+  if (loginError) {
+    toast('Login failed: ' + loginError, 'error');
+  }
 })();
 </script>
 </body>
