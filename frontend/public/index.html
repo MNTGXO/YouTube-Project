@@ -720,12 +720,11 @@ async function handleUpload() {
 
         const fd = new FormData();
         fd.append('chunk', chunk);
-        fd.append('uploadId', uploadId);
-        fd.append('chunkIndex', i);
         fd.append('totalChunks', totalChunks);
         fd.append('filename', selectedFile.name);
 
-        const r = await fetch('/api/videos/chunk', {
+        // uploadId and chunkIndex in URL so multer can read them before body is parsed
+        const r = await fetch(`/api/videos/chunk/${uploadId}/${i}`, {
           method: 'POST', credentials: 'include', body: fd
         });
         const d = await r.json();
