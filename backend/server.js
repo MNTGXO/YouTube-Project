@@ -17,6 +17,9 @@ const jobRoutes = require("./routes/jobs");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// ─── Trust proxy (REQUIRED for Koyeb / any reverse proxy behind HTTPS) ───────
+app.set("trust proxy", 1);
+
 // ─── Ensure upload dir exists ────────────────────────────────────────────────
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
@@ -57,20 +60,24 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(morgan("combined"));
 
 // ─── Session ──────────────────────────────────────────────────────────────────
+const isProduction = process.env.NODE_ENV === "production";
+
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "your-super-secret-key-change-this",
     resave: false,
     saveUninitialized: false,
+    name: "shortsai.sid",
     store: MongoStore.create({
       mongoUrl: process.env.MONGODB_URI,
       touchAfter: 24 * 3600,
+      ttl: 7 * 24 * 60 * 60, // 7 days
     }),
     cookie: {
-      secure: process.env.NODE_ENV === "production",
+      secure: isProduction,       // true on HTTPS (Koyeb)
       httpOnly: true,
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
+      sameSite: isProduction ? "none" : "lax", // "none" needed for cross-site on HTTPS
     },
   })
 );
@@ -88,7 +95,6 @@ if (fs.existsSync(frontendDist)) {
     res.sendFile(path.join(frontendDist, "index.html"));
   });
 } else {
-  // Serve static frontend in dev
   app.use(express.static(path.join(__dirname, "../frontend/public")));
   app.get("*", (req, res) => {
     res.sendFile(path.join(__dirname, "../frontend/public/index.html"));
@@ -104,7 +110,7 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT} | Production: ${isProduction}`);
 });
 
 module.exports = app;
