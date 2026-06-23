@@ -10,8 +10,25 @@ const { getVideoMetadata } = require("../utils/ffmpeg");
 
 const router = express.Router();
 
-// ─── Multer config ────────────────────────────────────────────────────────────
-const storage = multer.diskStorage({
+// ─── Multer for chunks (small pieces, no size limit per chunk) ────────────────
+const chunkStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const chunkDir = path.join(__dirname, "../uploads/chunks", req.body.uploadId || "unknown");
+    if (!fs.existsSync(chunkDir)) fs.mkdirSync(chunkDir, { recursive: true });
+    cb(null, chunkDir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, `chunk_${req.body.chunkIndex}`);
+  },
+});
+
+const chunkUpload = multer({
+  storage: chunkStorage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB per chunk
+});
+
+// ─── Multer for small direct uploads (< 50MB) ─────────────────────────────────
+const directStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadDir = path.join(__dirname, "../uploads");
     if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
@@ -23,63 +40,172 @@ const storage = multer.diskStorage({
   },
 });
 
-const fileFilter = (req, file, cb) => {
-  const allowedMimes = [
-    "video/mp4",
-    "video/avi",
-    "video/mov",
-    "video/mkv",
-    "video/webm",
-    "video/quicktime",
-    "video/x-msvideo",
-    "video/x-matroska",
-  ];
-  if (allowedMimes.includes(file.mimetype) || file.mimetype.startsWith("video/")) {
-    cb(null, true);
-  } else {
-    cb(new Error("Only video files are allowed"), false);
-  }
-};
-
-const upload = multer({
-  storage,
-  fileFilter,
-  limits: {
-    fileSize: 2 * 1024 * 1024 * 1024, // 2GB
+const directUpload = multer({
+  storage: directStorage,
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith("video/")) cb(null, true);
+    else cb(new Error("Only video files are allowed"), false);
   },
+  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB for direct
 });
 
-// ─── POST /api/videos/upload ──────────────────────────────────────────────────
-router.post("/upload", requireAuth, upload.single("video"), async (req, res) => {
+// ─── POST /api/videos/chunk ───────────────────────────────────────────────────
+// Receive one chunk of a large file
+router.post("/chunk", requireAuth, chunkUpload.single("chunk"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No video file provided" });
+    const { uploadId, chunkIndex, totalChunks, filename } = req.body;
+
+    if (!uploadId || chunkIndex === undefined || !totalChunks) {
+      return res.status(400).json({ error: "Missing chunk metadata" });
     }
 
-    const {
-      shortDuration = 60,
-      title = "YouTube Short",
-      description = "Created with ShortsAI",
-      tags = "shorts,youtube",
-      privacy = "public",
-    } = req.body;
+    // Store metadata in a temp JSON file
+    const metaPath = path.join(__dirname, "../uploads/chunks", uploadId, "meta.json");
+    if (!fs.existsSync(metaPath)) {
+      fs.writeFileSync(metaPath, JSON.stringify({
+        uploadId,
+        totalChunks: parseInt(totalChunks),
+        filename,
+        userId: req.user._id.toString(),
+      }));
+    }
+
+    const received = parseInt(chunkIndex) + 1;
+    const total = parseInt(totalChunks);
+
+    res.json({
+      received,
+      total,
+      done: received >= total,
+    });
+  } catch (err) {
+    console.error("Chunk upload error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/videos/assemble ────────────────────────────────────────────────
+// Assemble all chunks into final file, create Video record, auto-start job
+router.post("/assemble", requireAuth, async (req, res) => {
+  const { uploadId, shortDuration = 60, title = "YouTube Short",
+          description = "Created with ShortsAI", tags = "shorts,youtube", privacy = "public" } = req.body;
+
+  if (!uploadId) return res.status(400).json({ error: "uploadId required" });
+
+  const chunkDir = path.join(__dirname, "../uploads/chunks", uploadId);
+  const metaPath = path.join(chunkDir, "meta.json");
+
+  if (!fs.existsSync(metaPath)) {
+    return res.status(404).json({ error: "Upload session not found" });
+  }
+
+  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+
+  // Verify ownership
+  if (meta.userId !== req.user._id.toString()) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  try {
+    const ext = path.extname(meta.filename) || ".mp4";
+    const finalFilename = `${uuidv4()}${ext}`;
+    const finalPath = path.join(__dirname, "../uploads", finalFilename);
+    const writeStream = fs.createWriteStream(finalPath);
+
+    // Concatenate all chunks in order
+    for (let i = 0; i < meta.totalChunks; i++) {
+      const chunkPath = path.join(chunkDir, `chunk_${i}`);
+      if (!fs.existsSync(chunkPath)) {
+        writeStream.close();
+        fs.unlinkSync(finalPath);
+        return res.status(400).json({ error: `Missing chunk ${i}` });
+      }
+      const data = fs.readFileSync(chunkPath);
+      writeStream.write(data);
+    }
+
+    await new Promise((resolve, reject) => {
+      writeStream.end();
+      writeStream.on("finish", resolve);
+      writeStream.on("error", reject);
+    });
+
+    // Clean up chunk directory
+    fs.rmSync(chunkDir, { recursive: true, force: true });
+
+    // Get video metadata
+    let duration = null;
+    let fileSize = fs.statSync(finalPath).size;
+    try {
+      const { getVideoMetadata } = require("../utils/ffmpeg");
+      const metadata = await getVideoMetadata(finalPath);
+      duration = metadata.format.duration;
+    } catch (e) {
+      console.warn("Could not read video metadata:", e.message);
+    }
+
+    const tagList = typeof tags === "string"
+      ? tags.split(",").map(t => t.trim()).filter(Boolean)
+      : tags;
+
+    const video = new Video({
+      userId: req.user._id,
+      originalFilename: meta.filename,
+      localPath: finalPath,
+      fileSize,
+      duration,
+      mimeType: "video/mp4",
+      shortDuration: parseInt(shortDuration),
+      defaultTitle: title,
+      defaultDescription: description,
+      defaultTags: tagList,
+      privacy,
+      status: "uploaded",
+    });
+
+    await video.save();
+    await User.findByIdAndUpdate(req.user._id, { $inc: { totalVideosUploaded: 1 } });
+
+    res.status(201).json({
+      message: "Video assembled successfully",
+      video: {
+        id: video._id,
+        originalFilename: video.originalFilename,
+        fileSize: video.fileSize,
+        duration: video.duration,
+        estimatedClips: duration ? Math.ceil(duration / parseInt(shortDuration)) : null,
+        status: video.status,
+        createdAt: video.createdAt,
+      },
+    });
+  } catch (err) {
+    console.error("Assemble error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/videos/upload (small files direct) ────────────────────────────
+router.post("/upload", requireAuth, directUpload.single("video"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No video file provided" });
+
+    const { shortDuration = 60, title = "YouTube Short",
+            description = "Created with ShortsAI", tags = "shorts,youtube", privacy = "public" } = req.body;
 
     const filePath = req.file.path;
     let duration = null;
 
-    // Get video metadata
     try {
       const metadata = await getVideoMetadata(filePath);
       duration = metadata.format.duration;
-    } catch (err) {
-      console.warn("Could not read video metadata:", err.message);
+    } catch (e) {
+      console.warn("Could not read video metadata:", e.message);
     }
 
     const tagList = typeof tags === "string"
-      ? tags.split(",").map((t) => t.trim()).filter(Boolean)
+      ? tags.split(",").map(t => t.trim()).filter(Boolean)
       : tags;
 
-    // Save to DB
     const video = new Video({
       userId: req.user._id,
       originalFilename: req.file.originalname,
@@ -96,11 +222,7 @@ router.post("/upload", requireAuth, upload.single("video"), async (req, res) => 
     });
 
     await video.save();
-
-    // Update user stats
-    await User.findByIdAndUpdate(req.user._id, {
-      $inc: { totalVideosUploaded: 1 },
-    });
+    await User.findByIdAndUpdate(req.user._id, { $inc: { totalVideosUploaded: 1 } });
 
     res.status(201).json({
       message: "Video uploaded successfully",
@@ -116,10 +238,7 @@ router.post("/upload", requireAuth, upload.single("video"), async (req, res) => 
     });
   } catch (err) {
     console.error("Upload error:", err);
-    // Clean up file if it was saved
-    if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
-    }
+    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
     res.status(500).json({ error: err.message || "Upload failed" });
   }
 });
@@ -128,10 +247,8 @@ router.post("/upload", requireAuth, upload.single("video"), async (req, res) => 
 router.get("/", requireAuth, async (req, res) => {
   try {
     const videos = await Video.find({ userId: req.user._id })
-      .sort({ createdAt: -1 })
-      .limit(50)
+      .sort({ createdAt: -1 }).limit(50)
       .select("-localPath -clips.localPath");
-
     res.json({ videos });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -141,15 +258,9 @@ router.get("/", requireAuth, async (req, res) => {
 // ─── GET /api/videos/:id ─────────────────────────────────────────────────────
 router.get("/:id", requireAuth, async (req, res) => {
   try {
-    const video = await Video.findOne({
-      _id: req.params.id,
-      userId: req.user._id,
-    }).select("-localPath -clips.localPath");
-
-    if (!video) {
-      return res.status(404).json({ error: "Video not found" });
-    }
-
+    const video = await Video.findOne({ _id: req.params.id, userId: req.user._id })
+      .select("-localPath -clips.localPath");
+    if (!video) return res.status(404).json({ error: "Video not found" });
     res.json({ video });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -159,33 +270,17 @@ router.get("/:id", requireAuth, async (req, res) => {
 // ─── DELETE /api/videos/:id ──────────────────────────────────────────────────
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
-    const video = await Video.findOne({
-      _id: req.params.id,
-      userId: req.user._id,
-    });
-
-    if (!video) {
-      return res.status(404).json({ error: "Video not found" });
-    }
-
-    // Only allow deletion if not currently processing
+    const video = await Video.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!video) return res.status(404).json({ error: "Video not found" });
     if (["processing", "cutting", "uploading"].includes(video.status)) {
       return res.status(400).json({ error: "Cannot delete a video that is currently processing" });
     }
-
-    // Clean up files
     try {
       if (fs.existsSync(video.localPath)) fs.unlinkSync(video.localPath);
-      // Clean up clip files
       for (const clip of video.clips) {
-        if (clip.localPath && fs.existsSync(clip.localPath)) {
-          fs.unlinkSync(clip.localPath);
-        }
+        if (clip.localPath && fs.existsSync(clip.localPath)) fs.unlinkSync(clip.localPath);
       }
-    } catch (cleanupErr) {
-      console.warn("File cleanup warning:", cleanupErr.message);
-    }
-
+    } catch (e) { console.warn("Cleanup warning:", e.message); }
     await video.deleteOne();
     res.json({ message: "Video deleted successfully" });
   } catch (err) {
@@ -193,14 +288,8 @@ router.delete("/:id", requireAuth, async (req, res) => {
   }
 });
 
-// ─── Multer error handler ─────────────────────────────────────────────────────
 router.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(400).json({ error: "File too large. Maximum size is 2GB." });
-    }
-    return res.status(400).json({ error: err.message });
-  }
+  if (err.code === "LIMIT_FILE_SIZE") return res.status(400).json({ error: "Chunk too large. Max 10MB per chunk." });
   next(err);
 });
 
