@@ -692,33 +692,82 @@ async function handleUpload() {
 
   const btn = $('#upload-btn');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Uploading...';
+
+  const settings = {
+    shortDuration: $('#short-duration').value,
+    title: $('#title').value.trim() || 'YouTube Short',
+    description: $('#description').value.trim(),
+    tags: $('#tags').value.trim(),
+    privacy: $('#privacy').value,
+  };
 
   try {
-    const fd = new FormData();
-    fd.append('video', selectedFile);
-    fd.append('shortDuration', $('#short-duration').value);
-    fd.append('title', $('#title').value.trim() || 'YouTube Short');
-    fd.append('description', $('#description').value.trim());
-    fd.append('tags', $('#tags').value.trim());
-    fd.append('privacy', $('#privacy').value);
+    let video;
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk — well within Koyeb's timeout
 
-    const { video } = await fetch('/api/videos/upload', {
-      method: 'POST',
-      credentials: 'include',
-      body: fd
-    }).then(async r => {
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error || 'Upload failed');
-      return d;
-    });
+    if (selectedFile.size > CHUNK_SIZE) {
+      // ── Chunked upload for large files ────────────────────────────────────
+      const uploadId = crypto.randomUUID();
+      const totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE);
 
-    toast(`✅ Video uploaded! Estimated ${video.estimatedClips || '?'} clips`, 'success');
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, selectedFile.size);
+        const chunk = selectedFile.slice(start, end);
+
+        const pct = Math.round((i / totalChunks) * 90);
+        btn.innerHTML = `<span class="spinner"></span> Uploading ${pct}% (${i+1}/${totalChunks})`;
+
+        const fd = new FormData();
+        fd.append('chunk', chunk);
+        fd.append('uploadId', uploadId);
+        fd.append('chunkIndex', i);
+        fd.append('totalChunks', totalChunks);
+        fd.append('filename', selectedFile.name);
+
+        const r = await fetch('/api/videos/chunk', {
+          method: 'POST', credentials: 'include', body: fd
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || `Chunk ${i+1} failed`);
+      }
+
+      // Assemble chunks into final video
+      btn.innerHTML = '<span class="spinner"></span> Assembling...';
+      const result = await fetch('/api/videos/assemble', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploadId, ...settings })
+      }).then(async r => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Assemble failed');
+        return d;
+      });
+      video = result.video;
+
+    } else {
+      // ── Direct upload for small files (< 5MB) ─────────────────────────────
+      btn.innerHTML = '<span class="spinner"></span> Uploading...';
+      const fd = new FormData();
+      fd.append('video', selectedFile);
+      Object.entries(settings).forEach(([k,v]) => fd.append(k, v));
+
+      const result = await fetch('/api/videos/upload', {
+        method: 'POST', credentials: 'include', body: fd
+      }).then(async r => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Upload failed');
+        return d;
+      });
+      video = result.video;
+    }
+
+    toast(`✅ Uploaded! ~${video.estimatedClips || '?'} clips to create`, 'success');
     clearFile();
     btn.innerHTML = '✂️ Cut & Upload Shorts';
     btn.disabled = false;
 
-    // Auto-start job
+    // Auto-start processing job
     const { jobId } = await api('/api/jobs/start', {
       method: 'POST',
       body: JSON.stringify({ videoId: video.id })
